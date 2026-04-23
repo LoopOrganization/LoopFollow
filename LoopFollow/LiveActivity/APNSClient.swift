@@ -123,10 +123,17 @@ class APNSClient {
 
         let payload = buildStartPayload(attributesTitle: attributesTitle, state: state, staleDate: staleDate)
 
-        guard let url = URL(string: "\(apnsHost)/3/device/\(pushToStartToken)") else {
+        let host = apnsHost
+        guard let url = URL(string: "\(host)/3/device/\(pushToStartToken)") else {
             LogManager.shared.log(category: .apns, message: "APNs invalid URL (push-to-start)", isDebug: true)
             return .failed
         }
+
+        let environment = BuildDetails.default.isTestFlightBuild() ? "production" : "sandbox"
+        LogManager.shared.log(
+            category: .apns,
+            message: "APNs push-to-start sending host=\(host) env=\(environment) tokenTail=…\(String(pushToStartToken.suffix(8)))"
+        )
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -135,6 +142,7 @@ class APNSClient {
         request.setValue("\(bundleID).push-type.liveactivity", forHTTPHeaderField: "apns-topic")
         request.setValue("liveactivity", forHTTPHeaderField: "apns-push-type")
         request.setValue("10", forHTTPHeaderField: "apns-priority")
+        request.setValue("0", forHTTPHeaderField: "apns-expiration")
         request.httpBody = payload
 
         do {

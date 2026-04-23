@@ -140,6 +140,7 @@ final class LiveActivityManager {
             message: "[LA] adopt: id=\(activity.id) seq=\(incomingSeq) staleIn=\(staleDesc) totalActivities=\(totalActivities) (\(delayDescription))"
         )
         lastPushToStartSuccessAt = nil
+        pushToStartSendsWithoutAdoption = 0
 
         // If we already have a current activity and this is a different one, it's likely
         // the new push-to-start LA replacing an old one. End the old, then bind the new.
@@ -239,12 +240,14 @@ final class LiveActivityManager {
         let appState = UIApplication.shared.applicationState.rawValue
         let existing = Activity<GlucoseLiveActivityAttributes>.activities.count
 
+        let stuckSends = pushToStartSendsWithoutAdoption
+        let pushToStartLooksStuck = stuckSends >= LiveActivityManager.pushToStartForceRestartThreshold
         LogManager.shared.log(
             category: .general,
-            message: "[LA] foreground: appState=\(appState), activities=\(existing), renewalFailed=\(renewalFailed), overlayShowing=\(overlayIsShowing), current=\(current?.id ?? "nil"), dismissedByUser=\(dismissedByUser), renewBy=\(renewBy), now=\(now)"
+            message: "[LA] foreground: appState=\(appState), activities=\(existing), renewalFailed=\(renewalFailed), overlayShowing=\(overlayIsShowing), current=\(current?.id ?? "nil"), dismissedByUser=\(dismissedByUser), renewBy=\(renewBy), now=\(now), pushToStartSendsWithoutAdoption=\(stuckSends)"
         )
 
-        guard renewalFailed || overlayIsShowing else {
+        guard renewalFailed || overlayIsShowing || pushToStartLooksStuck else {
             LogManager.shared.log(category: .general, message: "[LA] foreground: no action needed (not in renewal window)")
             return
         }
@@ -253,10 +256,23 @@ final class LiveActivityManager {
         // foregroundActive — Activity.request() returns `visibility` during
         // this window. Defer the actual restart to didBecomeActive.
         pendingForegroundRestart = true
-        LogManager.shared.log(
-            category: .general,
-            message: "[LA] foreground: scheduling restart on next didBecomeActive (renewalFailed=\(renewalFailed), overlayShowing=\(overlayIsShowing))"
-        )
+        if pushToStartLooksStuck {
+            // Reset the counter now so we don't re-trigger on every foreground
+            // entry until the next round of silently-failed sends actually
+            // builds up again. The restart itself ends the current LA and
+            // starts a fresh one, which (per Apple's docs) should cause iOS to
+            // emit a new pushToStartToken — the workaround for FB21158660.
+            pushToStartSendsWithoutAdoption = 0
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] foreground: push-to-start looks stuck (sendsWithoutAdoption=\(stuckSends) ≥ \(LiveActivityManager.pushToStartForceRestartThreshold)) — forcing local restart to nudge token rotation"
+            )
+        } else {
+            LogManager.shared.log(
+                category: .general,
+                message: "[LA] foreground: scheduling restart on next didBecomeActive (renewalFailed=\(renewalFailed), overlayShowing=\(overlayIsShowing))"
+            )
+        }
     }
 
     private func performForegroundRestart() {
@@ -361,6 +377,15 @@ final class LiveActivityManager {
     /// the delay until iOS delivers the new activity via `activityUpdates`. If
     /// adoption never happens, a growing gap here is the fingerprint.
     private var lastPushToStartSuccessAt: Date?
+    /// Number of consecutive successful push-to-start APNs sends that have NOT
+    /// been followed by an `activityUpdates` adoption. When this reaches
+    /// `forceRestartThreshold`, the next foreground entry forces a local
+    /// restart even outside the renewal window — ending the existing LA and
+    /// starting a fresh one is the only known way to nudge iOS to issue a new
+    /// `pushToStartToken` when the current one has gone silent
+    /// (Apple FB21158660).
+    private var pushToStartSendsWithoutAdoption: Int = 0
+    private static let pushToStartForceRestartThreshold: Int = 2
     /// Base backoff after a 429 for push-to-start; doubled on each subsequent 429,
     /// capped at `pushToStartMaxBackoff`. Reset to zero after a successful send.
     private static let pushToStartBaseBackoff: TimeInterval = 300 // 5 min
@@ -790,9 +815,10 @@ final class LiveActivityManager {
             // and adoption don't re-fire push-to-start.
             Storage.shared.laPushToStartBackoff.value = LiveActivityManager.pushToStartBaseBackoff
             lastPushToStartSuccessAt = Date()
+            pushToStartSendsWithoutAdoption += 1
             LogManager.shared.log(
                 category: .general,
-                message: "[LA] push-to-start succeeded — awaiting activityUpdates to adopt new LA (backoff=\(Int(LiveActivityManager.pushToStartBaseBackoff))s)"
+                message: "[LA] push-to-start succeeded — awaiting activityUpdates to adopt new LA (backoff=\(Int(LiveActivityManager.pushToStartBaseBackoff))s, sendsWithoutAdoption=\(pushToStartSendsWithoutAdoption))"
             )
         case .rateLimited:
             let currentBackoff = Storage.shared.laPushToStartBackoff.value
