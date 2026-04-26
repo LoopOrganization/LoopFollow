@@ -390,6 +390,13 @@ final class LiveActivityManager {
     /// capped at `pushToStartMaxBackoff`. Reset to zero after a successful send.
     private static let pushToStartBaseBackoff: TimeInterval = 300 // 5 min
     private static let pushToStartMaxBackoff: TimeInterval = 3600 // 60 min
+    /// When push-to-start has been APNs-accepted but iOS hasn't adopted any new LA
+    /// after `endBeforePushToStartMinSends` attempts AND we are at least
+    /// `endBeforePushToStartOverdueThreshold` past the renewal deadline, end the
+    /// existing LA before the next push-to-start. Theory: iOS may dedupe pushes
+    /// while an LA of the same attributes-type is already active.
+    private static let endBeforePushToStartOverdueThreshold: TimeInterval = 30 * 60
+    private static let endBeforePushToStartMinSends: Int = 1
 
     // MARK: - Public API
 
@@ -737,7 +744,7 @@ final class LiveActivityManager {
     private func attemptPushToStartIfEligible(
         snapshot: GlucoseSnapshot,
         overdueBy: TimeInterval,
-        oldActivity _: Activity<GlucoseLiveActivityAttributes>
+        oldActivity: Activity<GlucoseLiveActivityAttributes>
     ) -> Bool {
         let token = Storage.shared.laPushToStartToken.value
         guard !token.isEmpty else {
@@ -777,13 +784,24 @@ final class LiveActivityManager {
         let tail = String(token.suffix(8))
         let existingActivities = Activity<GlucoseLiveActivityAttributes>.activities.count
         let staleInSeconds = Int(staleDate.timeIntervalSinceNow)
+        let stuckSends = pushToStartSendsWithoutAdoption
+        let shouldEndExistingFirst = overdueBy >= LiveActivityManager.endBeforePushToStartOverdueThreshold
+            && stuckSends >= LiveActivityManager.endBeforePushToStartMinSends
         LogManager.shared.log(
             category: .general,
-            message: "[LA] push-to-start firing overdueBy=\(Int(overdueBy))s token=…\(tail) seq=\(nextSeq) staleIn=\(staleInSeconds)s existingActivities=\(existingActivities) current=\(current?.id ?? "nil")"
+            message: "[LA] push-to-start firing overdueBy=\(Int(overdueBy))s token=…\(tail) seq=\(nextSeq) staleIn=\(staleInSeconds)s existingActivities=\(existingActivities) current=\(current?.id ?? "nil") endExistingFirst=\(shouldEndExistingFirst) sendsWithoutAdoption=\(stuckSends)"
         )
 
         let sendStart = Date()
         Task { [weak self] in
+            if shouldEndExistingFirst {
+                LogManager.shared.log(
+                    category: .general,
+                    message: "[LA] ending current LA id=\(oldActivity.id) before push-to-start (overdueBy=\(Int(overdueBy))s, sendsWithoutAdoption=\(stuckSends)) — testing whether iOS dedupes pushes against an existing LA"
+                )
+                await oldActivity.end(nil, dismissalPolicy: .immediate)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
             let result = await APNSClient.shared.sendLiveActivityStart(
                 pushToStartToken: token,
                 attributesTitle: "LoopFollow",
